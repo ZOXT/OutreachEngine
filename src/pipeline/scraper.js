@@ -4,6 +4,9 @@ const pool = require('../utils/db');
 require('dotenv').config({ path: require('path').join(__dirname, '../../.env') });
 const { log } = require('../utils/logger/logger');
 
+// ---------------------------------------------------------------------
+// Fetch page via FlareSolverr (bypasses Cloudflare)
+// ---------------------------------------------------------------------
 async function fetchPage() {
   let response;
 
@@ -20,16 +23,19 @@ async function fetchPage() {
       scriptingEnabled: true
     });
   } catch (err) {
+    // If the proxy isn't running, fail fast – nothing we can do
     if (err.code === 'ECONNREFUSED') {
       throw new Error('FlareSolverr is not running on port 8191. Start it with: docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest');
     }
     throw new Error(`FlareSolverr request failed: ${err.message}`);
   }
 
+  // FlareSolverr returned an error status
   if (response.data?.status === 'error') {
     throw new Error(`FlareSolverr error: ${response.data?.message}`);
   }
 
+  // No HTML? Then we can't scrape.
   if (!response.data?.solution?.response) {
     throw new Error('FlareSolverr returned empty response');
   }
@@ -37,6 +43,9 @@ async function fetchPage() {
   return response.data.solution.response;
 }
 
+// ---------------------------------------------------------------------
+// Try to extract a dollar amount from job metadata
+// ---------------------------------------------------------------------
 function extractBudget(typeArray) {
   if (!Array.isArray(typeArray)) return null;
   for (const item of typeArray) {
@@ -46,6 +55,9 @@ function extractBudget(typeArray) {
   return null;
 }
 
+// ---------------------------------------------------------------------
+// Insert or update jobs in bulk – log DB errors but don't crash the world
+// ---------------------------------------------------------------------
 async function saveJobsBulk(jobs) {
   if (!jobs.length) return;
 
@@ -76,10 +88,14 @@ async function saveJobsBulk(jobs) {
     const [result] = await pool.query(sql, [values]);
     log('INFO', `Inserted/updated: ${result.affectedRows} rows`);
   } catch (err) {
+    // Don't exit – maybe the DB is temporarily slow. We'll log and let the pipeline retry next run.
     log('ERROR', `DB save error: ${err.message}`);
   }
 }
 
+// ---------------------------------------------------------------------
+// Main scraping logic
+// ---------------------------------------------------------------------
 async function main() {
   log('INFO', 'Starting scraper...');
 
@@ -89,12 +105,13 @@ async function main() {
   } catch (err) {
     log('ERROR', `Failed to fetch page: ${err.message}`);
     await pool.end();
-    process.exit(1);
+    process.exit(1);   // Without HTML, there's no point continuing
   }
 
   const $ = cheerio.load(html);
   const jobs = [];
 
+  // Each job is an <article class="job-tile"> – Upwork structure
   $("article.job-tile").each((i, el) => {
     const job_id = $(el).attr("data-ev-job-uid") || "";
     const title = $(el).find("h2.job-tile-title a").first().text().trim();
@@ -126,6 +143,7 @@ async function main() {
     }
   });
 
+  // If the page loaded but we found zero jobs, either Upwork changed its HTML or Cloudflare is still blocking.
   if (jobs.length === 0) {
     log('ERROR', 'No jobs found in HTML — Cloudflare may have blocked the request or page structure changed');
     await pool.end();

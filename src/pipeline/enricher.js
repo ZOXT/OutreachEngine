@@ -7,97 +7,77 @@ if (!process.env.GROQ_API_KEY) throw new Error('Missing GROQ_API_KEY');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+// Helper to clean and normalise URLs
 function cleanUrl(url) {
   if (!url || url === 'null') return null;
+  // Remove markdown links [text](url)
   const markdown = url.match(/\[.*?\]\((https?:\/\/[^\)]+)\)/);
   if (markdown) return markdown[1];
+  // Ensure protocol
   return url.startsWith('http') ? url : `https://${url}`;
+}
+
+// Extract any direct email address from the job description
+function extractDirectEmail(description) {
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+  const match = description.match(emailRegex);
+  return match ? match[0] : null;
 }
 
 async function enrich(job, attempt = 1) {
   try {
-
     const response = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: [{
         role: "user",
-        content: `You are an AI orchestration engine inside a production-grade lead generation system.
+        content: `You are a high-conversion freelance proposal writer. Return ONLY valid JSON.
 
-Your job:
-1. Understand the client deeply
-2. Extract structured business intelligence
-3. Generate personalized outreach that converts
-4. Return ONLY valid JSON with no markdown or backticks
+{
+  "website": "company website URL or null",
+  "company_name": "company name or null",
+  "contact_name": "client first name if explicitly mentioned, else null",
+  "subject": "short personalized subject line under 10 words",
+  "proposal": "follow blueprint exactly"
+}
 
-Think like a senior freelance consultant, technical architect, and sales strategist. Never sound robotic, desperate, or AI-generated.
+━━━━━━━━━━━━━━━━━━
+PROPOSAL BLUEPRINT (must follow)
+━━━━━━━━━━━━━━━━━━
+Line 1: "Noticed you need [specific requirement from job] –"
+Line 2: "I just built something similar for [relevant industry] that [real result]." (use my experience, no fake metrics)
+Line 3: "One thing to consider: [specific insight about their project]."
+Line 4: "If you're free [day/time], I can [quick call / show a demo / share a case study]."
+
+RULES:
+- Never use greetings like "Hi", "I hope", "I'd love", "excited"
+- Never list generic skills (React, WordPress) – assume they read my profile
+- Keep under 150 words
+- Sound like an experienced peer, not a salesperson
 
 ━━━━━━━━━━━━━━━━━━
 ABOUT ME
 ━━━━━━━━━━━━━━━━━━
 Full-stack developer experienced in: React, Next.js, TypeScript, Node.js, PostgreSQL, WordPress, Shopify, WooCommerce, Tailwind CSS, Webflow, AI integrations, scalable backend systems.
 
-I build: SaaS apps, dashboards, internal tools, e-commerce systems, AI-powered products, workflow automation, scalable APIs, conversion-focused websites.
+I build: SaaS apps, dashboards, e-commerce systems, AI-powered products, workflow automation, scalable APIs, conversion-focused websites.
 
 Tone: concise, sharp, human, confident, calm, strategic.
-Never overhype, sound needy, use buzzwords, or sound like a generic freelancer.
-
-━━━━━━━━━━━━━━━━━━
-YOUR TASK
-━━━━━━━━━━━━━━━━━━
-Analyze the job post deeply. Understand:
-- what the client ACTUALLY wants
-- the real business problem
-- technical complexity
-- client sophistication level
-- whether this is worth pursuing
-
-Then generate:
-
-{
-  "website": "company website URL or null (extract from description)",
-  "company_name": "company name or null",
-  "contact_name": "client's first name if explicitly mentioned, else null",
-  "subject": "short personalized subject line under 10 words",
-  "proposal": "follow the blueprint below"
-}
-
-━━━━━━━━━━━━━━━━━━
-PROPOSAL BLUEPRINT (follow exactly)
-━━━━━━━━━━━━━━━━━━
-Line 1: Start with a specific insight about THEIR project – e.g., "Noticed you need [specific requirement] –"
-Line 2: Connect to a relevant past project (use my experience, don't invent metrics)
-Line 3: Offer a strategic observation or potential challenge
-Line 4: End with a clear, low-friction call to action (e.g., "If you're free Thursday, I can show a live demo.")
-
-RULES:
-- Never use greetings like "Hi", "I hope", "I'd love", "excited"
-- Never list generic skills (React, WordPress, etc.) – assume they read my profile
-- Keep under 150 words
-- Sound like an intelligent, experienced peer, not a salesperson
-
-━━━━━━━━━━━━━━━━━━
-EXTRACTION RULES
-━━━━━━━━━━━━━━━━━━
-- Website: if company name, product, or brand is mentioned, infer the likely URL. Return null if uncertain.
-- Company name: extract if clearly stated.
-- Contact name: only if a first name appears (e.g., "Hi, I'm John"). Never invent.
-- Subject: short, direct, personalized to the project.
 
 ━━━━━━━━━━━━━━━━━━
 JOB TITLE: ${job.title}
 JOB DESCRIPTION: ${job.description.slice(0, 1500)}`
       }],
       max_tokens: 800,
-      temperature: 0.4,   // lower temperature for more deterministic output
+      temperature: 0.3,   // more deterministic
     });
 
     const raw = response.choices[0].message.content.trim();
-
     let parsed;
+
     try {
       const cleaned = raw.replace(/```json|```/g, '').trim();
       parsed = JSON.parse(cleaned);
-    } catch {
+    } catch (err) {
       log('ERROR', `JSON parse failed for job ${job.job_id}: ${raw.slice(0, 100)}`);
       if (attempt < 3) {
         const wait = attempt * 2000;
@@ -108,7 +88,8 @@ JOB DESCRIPTION: ${job.description.slice(0, 1500)}`
       return null;
     }
 
-    if (!parsed.proposal || parsed.proposal.length < 50) {
+    // Validate proposal
+    if (!parsed.proposal || parsed.proposal.length < 40) {
       log('ERROR', `Proposal too short or missing for job ${job.job_id}`);
       if (attempt < 3) {
         await new Promise(r => setTimeout(r, attempt * 2000));
@@ -117,12 +98,22 @@ JOB DESCRIPTION: ${job.description.slice(0, 1500)}`
       return null;
     }
 
+    // Extract direct email from description (if any)
+    const directEmail = extractDirectEmail(job.description);
+    let emailsArray = [];
+    if (directEmail) {
+      emailsArray = [directEmail];
+      log('INFO', `Found direct email in description: ${directEmail}`);
+    }
+
+    // Final result
     return {
       website: cleanUrl(parsed.website),
       company_name: parsed.company_name && parsed.company_name !== 'null' ? parsed.company_name : null,
       contact_name: parsed.contact_name && parsed.contact_name !== 'null' ? parsed.contact_name : null,
       subject: parsed.subject || `Quick note on your project — ${job.title}`,
       proposal: parsed.proposal,
+      emails: emailsArray,  // store any direct email
     };
 
   } catch (err) {
@@ -169,6 +160,9 @@ async function main() {
     const result = await enrich(job);
 
     if (result) {
+      // Prepare emails JSON column
+      const emailsJson = JSON.stringify({ emails: result.emails });
+
       await pool.execute(
         `UPDATE jobs SET
           company_website = ?,
@@ -176,6 +170,7 @@ async function main() {
           contact_name = ?,
           email_subject = ?,
           proposal = ?,
+          emails = ?,
           proposal_generated_at = NOW(),
           status = 'enriched',
           error = NULL
@@ -186,10 +181,11 @@ async function main() {
           result.contact_name,
           result.subject,
           result.proposal,
+          emailsJson,
           job.job_id
         ]
       );
-      log('INFO', `Enriched: ${job.title} | website: ${result.website} | company: ${result.company_name}`);
+      log('INFO', `Enriched: ${job.title} | website: ${result.website} | company: ${result.company_name} | email: ${result.emails[0] || 'none'}`);
     } else {
       await pool.execute(
         `UPDATE jobs SET

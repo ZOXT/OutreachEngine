@@ -1,5 +1,5 @@
-const pool = require('./src/utils/db');
-const { log } = require('./src/utils/logger/logger');
+const pool = require('../src/utils/db');
+const { log } = require('../src/utils/logger/logger');
 require('dotenv').config();
 
 async function init() {
