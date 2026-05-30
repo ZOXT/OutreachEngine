@@ -119,7 +119,7 @@ JOB DESCRIPTION: ${job.description.slice(0, 1500)}`
   } catch (err) {
     log('ERROR', `Groq error on job ${job.job_id}: ${err.message}`);
     if (attempt < 3) {
-      await new Promise(r => setTimeout(r, attempt * 2000));
+      await new Promise(r => setTimeout(r, attempt * 3000));
       return enrich(job, attempt + 1);
     }
     return null;
@@ -204,7 +204,11 @@ async function main() {
   await pool.end();
 }
 
+let isShuttingDown = false;
+
 process.on('SIGINT', async () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   log('INFO', 'Gracefully shutting down...');
   await pool.end();
   process.exit(0);

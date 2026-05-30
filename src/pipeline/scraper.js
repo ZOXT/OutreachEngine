@@ -63,17 +63,12 @@ async function saveJobsBulk(jobs) {
 
   try {
     const sql = `
-      INSERT INTO jobs 
-      (job_id, title, description, type, budget, job_link, status)
-      VALUES ?
-      ON DUPLICATE KEY UPDATE
-        title = VALUES(title),
-        description = VALUES(description),
-        type = VALUES(type),
-        budget = VALUES(budget),
-        job_link = VALUES(job_link),
-        updated_at = CURRENT_TIMESTAMP
-    `;
+  INSERT INTO jobs 
+  (job_id, title, description, type, budget, job_link, status)
+  VALUES ?
+  ON DUPLICATE KEY UPDATE
+    updated_at = updated_at
+`;
 
     const values = jobs.map(job => [
       job.job_id,
@@ -156,7 +151,11 @@ async function main() {
   await pool.end();
 }
 
+let isShuttingDown = false;
+
 process.on('SIGINT', async () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   log('INFO', 'Gracefully shutting down...');
   await pool.end();
   process.exit(0);

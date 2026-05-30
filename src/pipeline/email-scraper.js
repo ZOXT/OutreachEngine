@@ -199,7 +199,11 @@ async function run() {
   }
 }
 
+let isShuttingDown = false;
+
 process.on('SIGINT', async () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   log('INFO', 'Gracefully shutting down...');
   await pool.end();
   process.exit(0);

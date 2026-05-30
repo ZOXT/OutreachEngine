@@ -1,167 +1,180 @@
+const transporter = require('../utils/mail');
 const pool = require('../utils/db');
-const Groq = require('groq-sdk');
 const { log } = require('../utils/logger/logger');
-const fs = require('fs');
-const path = require('path');
 require('dotenv').config({ path: require('path').join(__dirname, '../../.env') });
 
-if (!process.env.GROQ_API_KEY) throw new Error('Missing GROQ_API_KEY');
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-// Load prompt template from external file
-const PROMPT_TEMPLATE = fs.readFileSync(
-  path.join(__dirname, '../../prompts/enricher-prompt.txt'),
-  'utf8'
-);
-
-function cleanUrl(url) {
-  if (!url || url === 'null') return null;
-  const markdown = url.match(/\[.*?\]\((https?:\/\/[^\)]+)\)/);
-  if (markdown) return markdown[1];
-  return url.startsWith('http') ? url : `https://${url}`;
+if (!process.env.BREVO_FROM) {
+  log('ERROR', 'Missing BREVO_FROM in .env');
+  process.exit(1);
 }
 
-function extractDirectEmail(description) {
-  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
-  const match = description.match(emailRegex);
-  return match ? match[0] : null;
-}
 
-async function enrich(job, attempt = 1) {
-  // Inject job data into prompt template
-  const prompt = PROMPT_TEMPLATE
-    .replace('{{title}}', job.title)
-    .replace('{{description}}', job.description.slice(0, 2000));
+function cleanProposal(rawProposal) {
+  if (!rawProposal) return '';
 
+  // Remove markdown code blocks (```json ... ``` or just ``` ... ```)
+  let cleaned = rawProposal
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .trim();
+
+  // If it looks like a JSON object with a "proposal" field, extract it
   try {
-    const response = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 1100,
-      temperature: 0.7,
-    });
-
-    const raw = response.choices[0].message.content.trim();
-    let parsed;
-
-    try {
-      const cleaned = raw.replace(/```json|```/g, '').trim();
-      parsed = JSON.parse(cleaned);
-    } catch (err) {
-      log('ERROR', `JSON parse failed for job ${job.job_id}: ${raw.slice(0, 100)}`);
-      if (attempt < 3) {
-        const wait = attempt * 2000;
-        log('INFO', `Retrying in ${wait / 1000}s... (attempt ${attempt})`);
-        await new Promise(r => setTimeout(r, wait));
-        return enrich(job, attempt + 1);
-      }
-      return null;
+    const parsed = JSON.parse(cleaned);
+    if (parsed.proposal && typeof parsed.proposal === 'string') {
+      cleaned = parsed.proposal.trim();
     }
+  } catch {
+    // Not JSON – leave as is
+  }
 
-    if (!parsed.proposal || parsed.proposal.length < 100) {
-      log('ERROR', `Proposal too short for job ${job.job_id}`);
-      if (attempt < 3) {
-        await new Promise(r => setTimeout(r, attempt * 2000));
-        return enrich(job, attempt + 1);
-      }
-      return null;
+  // Remove any remaining markdown artifacts
+  cleaned = cleaned
+    .replace(/^proposal:\s*/i, '')
+    .replace(/^"|"$/g, '')
+    .trim();
+
+  return cleaned;
+}
+
+/**
+ * Extract email addresses from the emails JSON column
+ * Expected format: { "emails": ["a@b.com"], ... } or just an array
+ */
+function parseEmails(emailsJson) {
+  try {
+    const data = typeof emailsJson === 'string' ? JSON.parse(emailsJson) : emailsJson;
+    let emails = [];
+    if (Array.isArray(data)) {
+      emails = data;
+    } else if (data && Array.isArray(data.emails)) {
+      emails = data.emails;
     }
-
-    const directEmail = extractDirectEmail(job.description);
-    let emailsArray = directEmail ? [directEmail] : [];
-
-    return {
-      website: cleanUrl(parsed.website),
-      company_name: parsed.company_name && parsed.company_name !== 'null' ? parsed.company_name : null,
-      contact_name: parsed.contact_name && parsed.contact_name !== 'null' ? parsed.contact_name : null,
-      subject: parsed.subject || `Quick note on your project — ${job.title}`,
-      proposal: parsed.proposal,
-      emails: emailsArray,
-    };
-
+    // Basic validation
+    return emails.filter(e => 
+      e && typeof e === 'string' && 
+      e.includes('@') && 
+      !e.match(/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i)
+    );
   } catch (err) {
-    log('ERROR', `Groq error on job ${job.job_id}: ${err.message}`);
-    if (attempt < 3) {
-      await new Promise(r => setTimeout(r, attempt * 2000));
-      return enrich(job, attempt + 1);
-    }
-    return null;
+    log('ERROR', `Failed to parse emails JSON: ${err.message}`);
+    return [];
   }
 }
 
-async function main() {
-  log('INFO', 'Starting enricher...');
+/**
+ * Build a personalised greeting based on available data
+ * Avoids adding a greeting if the proposal already starts with one
+ */
+function buildGreeting(contactName, companyName, existingProposal) {
+  // If proposal already starts with "Hi", "Hello", "Dear", or similar, skip adding greeting
+  const trimmedProposal = existingProposal ? existingProposal.trim() : '';
+  if (/^(hi|hello|dear|hey|greetings)/i.test(trimmedProposal)) {
+    return '';
+  }
+
+  if (contactName && contactName !== 'null' && contactName.trim().length > 0) {
+    return `Hi ${contactName.trim()},\n\n`;
+  }
+  if (companyName && companyName !== 'null' && companyName.trim().length > 0) {
+    return `Hello ${companyName.trim()},\n\n`;
+  }
+  return `Hello,\n\n`;
+}
+
+async function run() {
+  log('INFO', '=== EMAIL SENDER STARTED ===');
   let jobs;
 
   try {
-    const results = await pool.execute(`
-      SELECT job_id, title, description
+    const [rows] = await pool.execute(`
+      SELECT job_id, title, emails, proposal, email_subject, contact_name, company_name
       FROM jobs
-      WHERE (
-        status = 'scraped'
-        OR status IS NULL
-        OR (status = 'enriching' AND updated_at < NOW() - INTERVAL 10 MINUTE)
-      )
-      AND description IS NOT NULL
+      WHERE status = 'emails_found'
+        AND emails IS NOT NULL
+        AND proposal IS NOT NULL
       LIMIT 10
     `);
-    jobs = results[0];
-    log('INFO', `Jobs to enrich: ${jobs.length}`);
+    jobs = rows;
+    log('INFO', `Jobs to send: ${jobs.length}`);
   } catch (err) {
     log('ERROR', `DB fetch error: ${err.message}`);
     process.exit(1);
   }
 
   for (const job of jobs) {
-    log('INFO', `Processing: ${job.title}`);
-    await pool.execute(`UPDATE jobs SET status = 'enriching' WHERE job_id = ?`, [job.job_id]);
+    const emailAddresses = parseEmails(job.emails);
+    let rawProposal = job.proposal;
+    let proposalText = cleanProposal(rawProposal);
 
-    const result = await enrich(job);
-
-    if (result) {
-      const emailsJson = JSON.stringify({ emails: result.emails });
+    if (!proposalText) {
+      log('ERROR', `Empty proposal for job ${job.job_id} – skipping`);
       await pool.execute(
-        `UPDATE jobs SET
-          company_website = ?,
-          company_name = ?,
-          contact_name = ?,
-          email_subject = ?,
-          proposal = ?,
-          emails = ?,
-          proposal_generated_at = NOW(),
-          status = 'enriched',
-          error = NULL
-        WHERE job_id = ?`,
-        [
-          result.website,
-          result.company_name,
-          result.contact_name,
-          result.subject,
-          result.proposal,
-          emailsJson,
-          job.job_id,
-        ]
-      );
-      log('INFO', `Enriched: ${job.title} | website: ${result.website} | company: ${result.company_name} | email: ${result.emails[0] || 'none'}`);
-    } else {
-      await pool.execute(
-        `UPDATE jobs SET status = 'failed', error = 'Groq enrichment failed after 3 attempts' WHERE job_id = ?`,
+        `UPDATE jobs SET status = 'failed', error = 'Empty proposal' WHERE job_id = ?`,
         [job.job_id]
       );
-      log('ERROR', `Failed to enrich job ${job.job_id}`);
+      continue;
     }
+
+    if (emailAddresses.length === 0) {
+      log('INFO', `No valid emails for job ${job.job_id} – marking as failed`);
+      await pool.execute(
+        `UPDATE jobs SET status = 'failed', error = 'No valid emails found' WHERE job_id = ?`,
+        [job.job_id]
+      );
+      continue;
+    }
+
+    // Build greeting only if not already present in proposal
+    const greeting = buildGreeting(job.contact_name, job.company_name, proposalText);
+    const finalEmailBody = greeting + proposalText;
+
+    const subject = job.email_subject || `Quick note on your project — ${job.title}`;
+
+    log('INFO', `Preview for job ${job.job_id}:\nSubject: ${subject}\nBody preview: ${finalEmailBody.slice(0, 200)}...`);
+
+    try {
+      // Send to each email address with a small delay between recipients
+      for (const email of emailAddresses) {
+        await transporter.sendMail({
+          from: process.env.BREVO_FROM,
+          to: email,
+          subject: subject,
+          text: finalEmailBody,
+        });
+        log('INFO', `Sent to ${email} for job ${job.job_id}`);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      await pool.execute(
+        `UPDATE jobs SET status = 'sent', email_sent_at = NOW() WHERE job_id = ?`,
+        [job.job_id]
+      );
+
+    } catch (err) {
+      log('ERROR', `Failed to send for job ${job.job_id}: ${err.message}`);
+      await pool.execute(
+        `UPDATE jobs SET status = 'failed', error = ? WHERE job_id = ?`,
+        [err.message, job.job_id]
+      );
+    }
+
     await new Promise(r => setTimeout(r, 500));
   }
 
-  log('INFO', 'Enricher done.');
+  log('INFO', 'Email sender done. Closing pool.');
   await pool.end();
 }
 
+let isShuttingDown = false;
+
 process.on('SIGINT', async () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   log('INFO', 'Gracefully shutting down...');
   await pool.end();
   process.exit(0);
 });
 
-main();
+run();
