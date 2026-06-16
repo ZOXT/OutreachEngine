@@ -7,7 +7,7 @@ const path = require('path');
 
 // load prompt once at startup
 const promptTemplate = fs.readFileSync(
-  path.join(__dirname, '../../prompts/enrich.prompt.txt'),
+  path.join(__dirname, '../../prompts/enricher.prompt.txt'),
   'utf8'
 );
 
